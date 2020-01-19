@@ -1,0 +1,726 @@
+---
+title: "alt-nif-analysis"
+author: "Shawn Higdon"
+date: "2/25/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(RColorBrewer)
+library(gplots)
+library(randomcoloR)
+library(rafalib)
+library(scales)
+library(viridis)
+library(pheatmap)
+library(circlize)
+library(ComplexHeatmap)
+library(Vennerable)
+```
+
+# All BCW Genomes - Dos Santos/Alt Nif search (611 Genomes) 2014 / 2015
+
+> Nif HDK ENB and AltNif Gene Analysis for all genomes
+
+## Read in the hmmscan matches
+
+> There is an error in one of the headers of the files that is causing rbind to fail. Will manually rename the columns to see if fix. 
+
+**NOTE: IT FIXED IT!**
+
+# MetaData
+```{r, message=FALSE}
+
+# ISOLATE LIST
+## Create a list of isolate genome IDs
+all_isolate_list <- read_csv("./meta_files/all_isolate_input.txt", col_names = F)
+
+# ISOLATE ID MAP
+## file containing map for ABB genome ID and BCW isolate ID
+abb_genome_bcw_labels <- read.csv("./meta_files/abb_genome_bcw_labels.csv", header = T)
+
+# SOURMASH TAXONOMY
+## file containing taxonomic match from sourmash lca classify output with k-size of 31
+all_genome_k31_lca <- read.csv("./meta_files/all_genomes_k31-smLCA-out.csv", header = T)
+### add BCW_ID to all_genome_k31_lca
+all_genome_k31_lca$BCW_ID <- abb_genome_bcw_labels$BCW_ID[match(all_genome_k31_lca$ID, abb_genome_bcw_labels$ABB_ID)]
+
+# BINS
+## read in number of bins from metabat
+all_bin_count <- read.csv("./meta_files/all_bin_count.csv", header = F, col.names = c("ID", "n_bins"))
+### add BCW_ID to all_bin_count
+all_bin_count$BCW_ID <- abb_genome_bcw_labels$BCW_ID[match(all_bin_count$ID, abb_genome_bcw_labels$ABB_ID)]
+```
+
+# NIFscan Data
+```{r}
+# Read in the hmmscan Search output files for nif genes in each isolate's annotated faa list
+all_nifscan_list <- list.files(path = "NIFscan_v2_output/TIGRFAM_39_nif", pattern = 'nif_core_hmm.dm.ps', recursive = T, full.names = T)
+#all_nifscan_list
+
+# Create a list of Kleb_pneu nifscan search output tables
+all_nifscan_tbl_list <- lapply(all_nifscan_list, read.delim)
+
+# set colnames
+all_nifscan_colnames <- c("Family",
+                          "HMM_Length",
+                          "Query_ID",
+                          "Query_Length",
+                          "E-value",
+                          "HMM_Start",
+                          "HMM_End",
+                          "Query_Start",
+                          "Query_End",
+                          "Coverage")
+
+all_nifscan_tbl_list <- lapply(all_nifscan_tbl_list, setNames, all_nifscan_colnames)
+
+# Add a column to every table that indicates the isolate genome for each NIF-TIGRFAM hmmscan hit
+all_nifscan_tbl_list <- mapply(cbind, all_nifscan_tbl_list, "isolate"=all_isolate_list$X1, SIMPLIFY=F)
+
+# Create One Dataframe for NIF-TIGRFAM matches of all isolates
+all_nifscan_df <- do.call('rbind', all_nifscan_tbl_list)
+
+# Add a column to each record that adds annotation information for each TIGRFAM
+## Read in map file
+tigr_def_list <- read_tsv("./meta_files/NIF_TIGRFAMs.txt", col_names = T)
+
+## match TIGRFAM annotation from tigr_def_list to nifscan family name
+all_nifscan_df$annotations <- tigr_def_list$Annotation[match(all_nifscan_df$Family, tigr_def_list$TIGRFAM)]
+
+## match ABB isolate ID on all_nifscan_df to BCW_ID on abb_genome_bcw_labels
+all_nifscan_df$BCW_ID <- abb_genome_bcw_labels$BCW_ID[match(all_nifscan_df$isolate, abb_genome_bcw_labels$ABB_ID)]
+
+
+```
+
+## HMM Hit Filter
+
+* 85% Coverage
+```{r}
+
+# Create a Function to Filter with max. e-value cut off and 0.9 min. model coverage
+psHMM_filter <- function(x) {
+  filter(x, `E-value` <= 1e-06, `Coverage` >= 0.85)
+}
+
+all_nifscan_filtered <- psHMM_filter(all_nifscan_df)
+
+```
+
+### Count the Hits
+```{r}
+
+# count number of records for unique combinations of TIGRFAM, BCW_ID, pro_query
+all_nifscan_filtered_grp <- all_nifscan_filtered %>% 
+  group_by(Family, BCW_ID, Query_ID) %>% 
+  summarise(count=n())
+
+all_nifscan_filtered_grp
+nlevels(all_nifscan_filtered$BCW_ID) %>% unique()
+
+# Identify which records have multiple hits returned
+
+all_nifscan_filtered_replicates <- all_nifscan_filtered_grp %>% 
+  filter(count != 1)
+
+all_nifscan_filtered_replicates
+
+```
+
+#### De-duplicate the filtered data frame
+```{r}
+
+# count number of records for unique combinations of TIGRFAM, BCW_ID, pro_query
+all_nifscan_filtered_dup <- all_nifscan_filtered %>% 
+  group_by(Family, BCW_ID, Query_ID) %>% 
+  mutate(count = (n()))
+nlevels(all_nifscan_filtered_dup$BCW_ID)
+
+#?top_n - this function selects one based on value of a variable
+
+all_nifscan_filtered_dedup <- all_nifscan_filtered_dup %>% top_n(1, Coverage) # it works :)
+
+nlevels(all_nifscan_filtered_dedup$BCW_ID)
+
+```
+
+#### Generate Counts and Dataframe
+
+> for all 39 TIGRFAM hmms scanned against all 588 isolate genomes
+
+```{r}
+
+# Create a data frame with new variable of counts for each annotation call
+all_nifscan_filtered_count <- all_nifscan_filtered_dedup %>% group_by(annotations, BCW_ID) %>% count()
+nlevels(all_nifscan_filtered_count$BCW_ID) %>% unique() # check to make sure no isolate drops
+
+# convert annotation calls to factor type
+all_nifscan_filtered_count$annotations <- as.factor(all_nifscan_filtered_count$annotations)
+
+# convert dataframe from narrow to wide format
+all_nifscan_filtered_df <- spread(all_nifscan_filtered_count, BCW_ID, n, drop = F)
+
+# transpose
+all_nifscan_filtered_df <- t(all_nifscan_filtered_df)
+
+# colnames
+colnames(all_nifscan_filtered_df) <- all_nifscan_filtered_df[1,]
+
+# remove annotation row
+all_nifscan_filtered_df <- all_nifscan_filtered_df[-1,]
+
+# revert to data frame
+all_nifscan_filtered_df <- as.data.frame(all_nifscan_filtered_df)
+
+```
+
+### Subset for Alt.Nif Genes
+```{r}
+
+## subset all_nifscan df to select only alt nif gene models + Mo-Fe mdoels
+alt_nif_filtered_df <- all_nifscan_filtered_df %>% select("vnfK_nitrog",
+                                                      "vnfG_nitrog",
+                                                      "VNFD",
+                                                      "anfK_nitrog",
+                                                      "anfG_nitrog",
+                                                      "ANFD",
+                                                      "nifD",
+                                                      "nifK",
+                                                      "nifH",
+                                                      "nifE",
+                                                      "nifN",
+                                                      "nifB")
+
+## add column to df with genus information for each isolate
+alt_nif_filtered_df$Genus <- all_genome_k31_lca$genus[match(rownames(alt_nif_filtered_df), all_genome_k31_lca$BCW_ID)]
+alt_nif_filtered_df$Genus <- sub("^$", "unassigned", alt_nif_filtered_df$Genus) # fill empty values as 'unassigned'
+
+## add column to df with bin information for each isolate
+alt_nif_filtered_df$n_bins <- all_bin_count$n_bins[match(rownames(alt_nif_filtered_df), all_bin_count$BCW_ID)]
+
+## add column to df with BCW_ID information for each isolate
+alt_nif_filtered_df$BCW_ID <- rownames(alt_nif_filtered_df)
+
+# filter again, removing eukaryotic isolates and co-cultures
+alt_nif_filtered_df <- alt_nif_filtered_df %>% 
+  filter(Genus != "Meyerozyma" & 
+           Genus != "Rhodotorula" &
+           n_bins == 1)
+
+# restore rownames to BCW_ID
+rownames(alt_nif_filtered_df) <- alt_nif_filtered_df$BCW_ID
+
+# create unique genus color for plotting
+set.seed(1977)
+genus_colors <- data.frame(Genus = unique(alt_nif_filtered_df$Genus), Color =  distinctColorPalette(length(unique(alt_nif_filtered_df$Genus))))
+
+```
+
+### Create Nif Groups
+
+#### Format Filtered Data Frame
+```{r}
+## Make a matrix of hmm hits using filtered data
+alt_nif_mat <- as.matrix(alt_nif_filtered_df[,1:12])
+
+## replace NA values with zero
+alt_nif_mat[is.na(alt_nif_mat)] <- 0
+
+## set rownames equal to the filtered df rownames
+rownames(alt_nif_mat) <- rownames(alt_nif_filtered_df)
+
+## set class to numeric
+class(alt_nif_mat) <- "numeric"
+
+## revert to data frame
+alt_nif_df <- as.data.frame(alt_nif_mat)
+
+## set rownames
+alt_nif_df$ID <- rownames(alt_nif_df)
+
+## verify numeric
+summary(alt_nif_df)
+
+## add Genus
+alt_nif_df$Genus <- alt_nif_filtered_df$Genus[match(alt_nif_df$ID, alt_nif_filtered_df$BCW_ID)]
+
+## add genus color
+alt_nif_df$Genus_color <- genus_colors$Color[match(alt_nif_df$Genus, genus_colors$Genus)]
+```
+
+### Dos Santos Positive
+```{r}
+# filter to select Dos Santos Positive Isolates
+## Select isolates with >= 1 hit for nif 6 gene core set
+dsp_mono_prok_df <- filter(alt_nif_df,
+                           nifD >= 1,
+                           nifK >= 1,
+                           nifH >= 1,
+                           nifE >= 1,
+                           nifN >= 1,
+                           nifB >= 1)
+## restore rownames
+rownames(dsp_mono_prok_df) <- dsp_mono_prok_df$ID
+
+## add Genus variable
+dsp_mono_prok_df$Genus <- alt_nif_filtered_df$Genus[match(dsp_mono_prok_df$ID, alt_nif_filtered_df$BCW_ID)]
+
+## create matrix from dataframe
+dsp_mono_prok_mat <- as.matrix(dsp_mono_prok_df[, 1:12])
+
+## make rownames of matrix BCW isolate ID
+rownames(dsp_mono_prok_mat) <- rownames(dsp_mono_prok_df)
+```
+
+### Dos Santos Negative
+```{r}
+# filter to select Dos Santos Positive Isolates
+## Select isolates with >= 1 hit for nif 6 gene core set
+dsn_mono_prok_df <- filter(alt_nif_df,
+                           nifD == 0,
+                           nifK == 0,
+                           nifH == 0,
+                           nifE == 0,
+                           nifN == 0,
+                           nifB == 0)
+## restore rownames
+rownames(dsn_mono_prok_df) <- dsn_mono_prok_df$ID
+
+## add Genus variable
+dsn_mono_prok_df$Genus <- alt_nif_filtered_df$Genus[match(dsn_mono_prok_df$ID, alt_nif_filtered_df$BCW_ID)]
+
+## create matrix from dataframe
+dsn_mono_prok_mat <- as.matrix(dsn_mono_prok_df[, 1:12])
+
+## make rownames of matrix BCW isolate ID
+rownames(dsn_mono_prok_mat) <- rownames(dsn_mono_prok_df)
+```
+
+### Semi Dos Santos
+```{r}
+# filter to select Semi Dos Santos Isolates
+## grab isolates not in the 'Santos_pos' subset above
+
+sds_mono_prok_df <- subset(alt_nif_df, !(ID %in% dsp_mono_prok_df$ID) & !(ID %in% dsn_mono_prok_df$ID))
+
+## restore rownames
+rownames(sds_mono_prok_df) <- sds_mono_prok_df$ID
+
+## add Genus variable
+sds_mono_prok_df$Genus <- alt_nif_filtered_df$Genus[match(sds_mono_prok_df$ID, alt_nif_filtered_df$BCW_ID)]
+
+## create matrix from dataframe
+sds_mono_prok_mat <- as.matrix(sds_mono_prok_df[, 1:12])
+
+## make rownames of matrix BCW isolate ID
+rownames(sds_mono_prok_mat) <- rownames(sds_mono_prok_df)
+```
+
+> Interestingly they only have NifH, except for one isolate
+
+#### Subset for Gamma/Delta subunit Presence
+
+* Select only isolates with nif Gamma/Delta subunit gene model hits
+```{r}
+
+# Subset again to select only isolates that have nif Gamma/Delta subunit gene model hits
+alt_nif_gamma_df <- filter(alt_nif_df,
+                           vnfG_nitrog >= 1,
+                           anfG_nitrog >= 1
+                           ) %>%
+  select("ANFD",
+         "anfK_nitrog",
+         "anfG_nitrog",
+         "VNFD",
+         "vnfK_nitrog",
+         "vnfG_nitrog",
+         "nifD",
+         "nifK",
+         "nifH",
+         "ID",
+         "Genus",
+         "Genus_color")
+
+## restore rownames
+rownames(alt_nif_gamma_df) <- alt_nif_gamma_df$ID
+
+## add Genus variable
+alt_nif_gamma_df$Genus <- alt_nif_filtered_df$Genus[match(alt_nif_gamma_df$ID, alt_nif_filtered_df$BCW_ID)]
+
+## create matrix from dataframe
+alt_nif_gamma_mat <- as.matrix(alt_nif_gamma_df[, 1:9])
+
+## make rownames of matrix BCW isolate ID
+rownames(alt_nif_gamma_mat) <- rownames(alt_nif_gamma_df)
+
+# customize the order of hmms for the matrix
+alt_nif_order <- c("ANFD",
+                   "anfK_nitrog",
+                   "anfG_nitrog",
+                   "VNFD",
+                   "vnfK_nitrog",
+                   "vnfG_nitrog",
+                   "nifD",
+                   "nifK",
+                   "nifH")
+
+# Re-order the columns
+alt_nif_gamma_mat <- alt_nif_gamma_mat[,alt_nif_order]
+rownames(alt_nif_gamma_df)
+# Remove split-isolate BCW-200557.1
+alt_nif_gamma_df <- alt_nif_gamma_df[-17,]
+
+# write tsv of alt. nif isolate list
+alt_nif_pure_isolate_list <- data.frame(ID = alt_nif_gamma_df$ID)
+
+write_tsv(alt_nif_pure_isolate_list, "./R_output_files/alt_nif_pure_isolate_ids.txt", col_names = F)
+
+## add genus info
+alt_nif_pure_isolate_list$Genus <- alt_nif_df$Genus[match(alt_nif_pure_isolate_list$ID, alt_nif_df$ID)]
+
+# write tsv of alt. nif isolate list plus genus
+write_csv(alt_nif_pure_isolate_list, "./R_output_files/alt_nif_pure_isolate_genus_map.csv", col_names = F)
+
+```
+
+> `alt_nif_pure_isolate_list` was used to group sourmash signatures for comparison on the hpc.
+
+* `--scaled 2000`
+* `-k 31`
+
+## Sourmash Comparison Plot
+
+> Use Complex Heatmaps to plot Composite Matrix
+
+```{r}
+# Read in Sourmash Compare matrix
+smash_alt_nif_df <- read.csv("./sourmash_data/alt_nif_pure_isolates.csv", header = T, check.names = F)
+
+# make rownames equal colnames
+rownames(smash_alt_nif_df) <- colnames(smash_alt_nif_df)
+
+# add genus assignment to each row of dataframe
+smash_alt_nif_df$Genus <- alt_nif_filtered_df$Genus[match(rownames(smash_alt_nif_df), alt_nif_filtered_df$BCW_ID)]
+
+# add genus color assignment to each row of dataframe
+smash_alt_nif_df$Genus_color <- alt_nif_df$Genus_color[match(rownames(smash_alt_nif_df), alt_nif_df$ID)]
+
+# make Genus as factor
+smash_alt_nif_df$Genus <- factor(smash_alt_nif_df$Genus)
+
+# make matrix for plotting
+smash_alt_nif_mat <- as.matrix(smash_alt_nif_df[, grep("BCW_2", colnames(smash_alt_nif_df), rownames(smash_alt_nif_df))])
+
+# make 'smash_mat' numeric in type
+class(smash_alt_nif_mat) <- "numeric"
+
+# make distinct color palette for genus colors
+smash_alt_nif_genus_colors <- unique(smash_alt_nif_df$Genus_color)
+
+# assign matrix color scale
+smash_alt_nif_mat_color <- viridis(direction = -1, 6)
+```
+
+### Visualize Sourmash Comparison
+```{r}
+# make the complex heatmap
+chm_smash_alt_nif_mat <- 
+  Heatmap(smash_alt_nif_mat,
+          name = "Jaccard Index",
+          heatmap_legend_param = list(color_bar = "continuous",
+                                      legend_direction = "horizontal",
+                                      legend_width = unit(8, "cm"),
+                                      title_position = "lefttop",
+                                      title_gp = gpar(fontsize = 12),
+                                      labels_gp = gpar(fontsize = 12)),
+          col = smash_alt_nif_mat_color,
+          row_names_gp = gpar(fontsize = 4),
+          show_column_names = F
+  )
+
+chm_smash_alt_nif_genus <- 
+  Heatmap(smash_alt_nif_df$Genus,
+          name = "Genus",
+          col = smash_alt_nif_genus_colors,
+          heatmap_legend_param = list(ncol = 1,
+                                      title_position = "lefttop",
+                                      title_gp = gpar(fontsize = 16),
+                                      labels_gp = gpar(fontsize = 14)),
+          width = unit(5, "mm"),
+          column_names_gp = gpar(fontsize = 16))
+
+chm_smash_alt_nif_list <- chm_smash_alt_nif_mat + chm_smash_alt_nif_genus
+
+smash_alt_nif_chm <- 
+draw(chm_smash_alt_nif_list, heatmap_legend_side = "bottom", annotation_legend_side = "right")
+```
+
+
+## Fig 4 - MS1 - Alt. Nif Genes
+
+**Vanadium Type Alternative Nitrogenase includes**
+
+* vnfD
+* vnfK
+* vnfG
+
+### Subset for Alt.Nif Genes
+```{r}
+
+## subset all_nifscan df to select only alt nif gene models
+alt_nif_VennD <- alt_nif_filtered_df %>%
+  filter(BCW_ID %in% alt_nif_pure_isolate_list$ID) %>% 
+  select("vnfK_nitrog",
+         "vnfG_nitrog",
+         "VNFD",
+         "anfK_nitrog",
+         "anfG_nitrog",
+         "ANFD",
+         "nifD",
+         "nifK",
+         "nifH",
+         "BCW_ID")
+
+# convert all factor vectors to numeric vectors
+indx <- sapply(alt_nif_VennD, is.factor)
+alt_nif_VennD[indx] <- lapply(alt_nif_VennD[indx], function(x) as.numeric(as.factor(x)))
+
+# Add BCW_ID column
+#alt_nif_VennD$BCW_ID <- rownames(alt_nif_VennD)
+
+## replace NA with zero values
+alt_nif_VennD[is.na(alt_nif_VennD)] <- 0
+
+# Generate Subsets based on Gene Model Sets (Vnf, Anf, Classic_Mo-Fe[nifD, nifK])
+alt_nif_VennD_vnf <- filter(alt_nif_VennD, vnfK_nitrog >= 1 &
+                                  vnfG_nitrog >= 1 &
+                                  VNFD >= 1)
+
+alt_nif_VennD_anf <- filter(alt_nif_VennD, anfK_nitrog >= 1 &
+                                  anfG_nitrog >= 1 &
+                                  ANFD >= 1)
+
+alt_nif_VennD_FeMo_dk <- filter(alt_nif_VennD, nifD >= 1 &
+                                      nifK >= 1)
+
+alt_nif_VennD_nifH <- filter(alt_nif_VennD, nifH >= 1)
+
+alt_nif_list <- list("Vn-Fe" = alt_nif_VennD_vnf$BCW_ID, "Fe-Fe" = alt_nif_VennD_anf$BCW_ID, "Mo-Fe" = alt_nif_VennD_FeMo_dk$BCW_ID, "nifH" = alt_nif_VennD_nifH$BCW_ID)
+
+```
+
+## Sourmash Taxonomy of Alt. Nif Isolates
+```{r}
+# modify taxonomy df for join
+alt_nif_smash_lca <- all_genome_k31_lca %>% select("BCW_ID",
+                                           "superkingdom",
+                                           "phylum",
+                                           "class",
+                                           "order",
+                                           "family",
+                                           "genus",
+                                           "species")
+
+# subset lca for alt_nif_VennD isolates only
+alt_nif_smash_lca <- alt_nif_smash_lca %>% filter(BCW_ID %in% alt_nif_VennD$BCW_ID)
+
+# join smash_lca with alt. nif gene count data for targeted genomes
+alt_nif_master <- full_join(alt_nif_VennD, smash_lca, by = "BCW_ID")
+
+```
+
+
+## Plot Venn Diagram
+```{r}
+
+str(alt_nif_list)
+
+V_alt_nif <- Venn(alt_nif_list)
+V_alt_nif
+
+
+anf_VD_plot <- plot(V_alt_nif, doWeights = FALSE)
+
+
+```
+
+```{r}
+# Make list of isolates with Alt Nif Genes
+alt_nif_isolates_df <- data.frame(isolates = V_alt_nif@IntersectionSets[["1111"]])
+
+# Write it to tsv file
+write_tsv(alt_nif_isolates_df, "./alt_nif_isolate_ids.txt", col_names = F)
+
+# generate isolate ID map file (between ABB number and BCW_IDs) for sourmash signatures
+
+all_isolate_id_map <- all_genome_k31_lca %>% select(ID, BCW_ID)
+all_isolate_id_map$ID <- as.character(all_isolate_id_map$ID)
+all_isolate_id_map$ID <- paste0(all_isolate_id_map$ID,".sig")
+all_isolate_id_map$BCW_ID <- as.character(all_isolate_id_map$BCW_ID)
+all_isolate_id_map$BCW_ID <- paste0(all_isolate_id_map$BCW_ID,".sig")
+write_csv(all_isolate_id_map, "./isolate_id_map.txt", col_names = F)
+
+```
+
+### Alt.Nif-MONO PROK
+```{r}
+# read in all pure isolate list
+pure_isolate_list <- read_csv("./meta_files/all_pure_isolate_list.csv", col_names = F)
+
+## subset all_nifscan df to select only alt nif gene models
+alt_nif_mono_prok_VennD <- all_nifscan_filtered_df %>% 
+  select("vnfK_nitrog",
+         "vnfG_nitrog",
+         "VNFD",
+         "anfK_nitrog",
+         "anfG_nitrog",
+         "ANFD",
+         "nifD",
+         "nifK",
+         "nifH")
+
+# convert all factor vectors to numeric vectors
+indx <- sapply(alt_nif_mono_prok_VennD, is.factor)
+alt_nif_mono_prok_VennD[indx] <- lapply(alt_nif_mono_prok_VennD[indx], function(x) as.numeric(as.factor(x)))
+
+# Add BCW_ID column
+alt_nif_mono_prok_VennD$BCW_ID <- rownames(alt_nif_mono_prok_VennD)
+
+# Add bin count
+alt_nif_mono_prok_VennD$n_bins <- all_bin_count$n_bins[match(alt_nif_mono_prok_VennD$BCW_ID, all_bin_count$BCW_ID)]
+
+## subset alt_nif_mono_prok_VennD to include only pure isolates presented in manuscript 1
+alt_nif_mono_prok_VennD <- alt_nif_mono_prok_VennD %>% filter(BCW_ID %in% pure_isolate_list$X1)
+
+## replace NA with zero values
+alt_nif_mono_prok_VennD[is.na(alt_nif_mono_prok_VennD)] <- 0
+
+# Generate Subsets based on Gene Model Sets (Vnf, Anf, Classic_Mo-Fe[nifD, nifK])
+alt_nif_mono_prok_vnf <- filter(alt_nif_mono_prok_VennD, vnfK_nitrog >= 1 &
+                                  vnfG_nitrog >= 1 &
+                                  VNFD >= 1 &
+                                  n_bins ==1)
+
+alt_nif_mono_prok_anf <- filter(alt_nif_mono_prok_VennD, anfK_nitrog >= 1 &
+                                  anfG_nitrog >= 1 &
+                                  ANFD >= 1 &
+                                  n_bins ==1)
+
+alt_nif_mono_prok_FeMo_dk <- filter(alt_nif_mono_prok_VennD,
+                                    nifD >= 1 &
+                                    nifK >= 1 &
+                                    n_bins ==1)
+
+alt_nif_mono_prok_nifH <- filter(alt_nif_mono_prok_VennD,
+                                 nifH >= 1 &
+                                 n_bins ==1)
+
+alt_nif_mono_prok_list <- list("Vn-Fe" = alt_nif_mono_prok_vnf$BCW_ID, "Fe-Fe" = alt_nif_mono_prok_anf$BCW_ID, "Mo-Fe" = alt_nif_mono_prok_FeMo_dk$BCW_ID, "nifH" = alt_nif_mono_prok_nifH$BCW_ID)
+
+```
+
+
+## Plot Venn Diagram
+```{r}
+
+library(devtools)
+library(Vennerable)
+
+str(alt_nif_mono_prok_list)
+
+V_alt_nif_mono_prok <- Venn(alt_nif_mono_prok_list)
+V_alt_nif_mono_prok
+
+anf_VD_mono_prok_plot <- plot(V_alt_nif_mono_prok, doWeights = FALSE)
+
+```
+
+### check
+```{r}
+check1 <- alt_nif_VennD %>% filter(!BCW_ID %in% pure_isolate_list$X1)
+```
+
+
+```{r}
+# Make list of mono prokaryotic isolates with Alt Nif Genes
+alt_nif_isolates_mono_prok_df <- data.frame(isolates = V_alt_nif_mono_prok@IntersectionSets[["1111"]])
+
+# Write it to tsv file
+write_tsv(alt_nif_isolates_mono_prok_df, "./alt_nif_isolate_mono_prok_ids.txt", col_names = F)
+
+# generate isolate ID map file (between ABB number and BCW_IDs) for sourmash signatures
+
+mono_prok_anf_isolate_id_map <- all_genome_k31_lca %>% select(ID, BCW_ID)
+
+mono_prok_anf_isolate_id_map$ID <- as.character(mono_prok_anf_isolate_id_map$ID)
+
+mono_prok_anf_isolate_id_map$ID <- paste0(mono_prok_anf_isolate_id_map$ID,".sig")
+
+mono_prok_anf_isolate_id_map$BCW_ID <- as.character(mono_prok_anf_isolate_id_map$BCW_ID)
+
+mono_prok_anf_isolate_id_map$BCW_ID <- paste0(mono_prok_anf_isolate_id_map$BCW_ID,".sig")
+
+write_csv(mono_prok_anf_isolate_id_map, "./isolate_id_map.txt", col_names = F)
+```
+
+
+
+##### Plot Ranked by 15N / 14N Ratio
+
+```{r}
+# Make a ranked list of the same isolates that lack the essential nitrogenase genes proposed by Santos
+alt_nif_santos_0.9cov_df_rnk <- alt_nif_santos_0.9cov_df[order(alt_nif_santos_0.9cov_df$N_ratio,
+                                                       -rank(alt_nif_santos_0.9cov_df$N_ratio), decreasing = T),]
+
+## create matrix from dataframe
+alt_nif_santos_0.9cov_mat_rnk <- as.matrix(alt_nif_santos_0.9cov_df_rnk[, c(1:8)])
+
+## make rownames of matrix BCW isolate ID
+rownames(alt_nif_santos_0.9cov_mat_rnk) <- alt_nif_santos_0.9cov_df_rnk$BCW_ID
+
+## replace NA with zero values in order to cluster
+alt_nif_santos_0.9cov_mat_rnk[is.na(alt_nif_santos_0.9cov_mat_rnk)] <- 0
+
+class(alt_nif_santos_0.9cov_mat_rnk) <- "numeric"
+
+## Order columns
+alt_nif_santos_0.9cov_mat_rnk <- alt_nif_santos_0.9cov_mat_rnk[,alt_nif_order]
+
+# Annotations
+
+colormap_alt_nif_santos_0.9cov_rnk <- colorRamp2(seq(0, 7, length.out = 8), plasma(direction = -1, 8))
+
+genus_colors_alt_nif_santos_0.9cov_rnk <- distinctColorPalette(length(unique(alt_nif_santos_0.9cov_df_rnk$Genus)))
+
+# Plot
+
+alt_nif_santos_0.9cov_rnk_chm_1 <- 
+  Heatmap(alt_nif_santos_0.9cov_mat_rnk,
+          name = "HMM Hits",
+          col = colormap_santos_pos_0.9cov_rnk,
+          cluster_columns = F,
+          cluster_rows = F,
+          heatmap_legend_param = list(at = seq(0, 14, 1)),
+          row_names_gp = gpar(fontsize = 2.5))
+
+alt_nif_santos_0.9cov_rnk_chm_2 <-
+  Heatmap(alt_nif_santos_0.9cov_df_rnk$Genus, name = "Genus", col = genus_colors_santos_pos_0.9cov, 
+          width = unit(5, "mm"))
+
+alt_nif_santos_0.9cov_rnk_chm_3 <-
+  Heatmap(alt_nif_santos_0.9cov_df_rnk$N_ratio, name = "15N/14N", col = inferno(direction = -1, 6), width = unit(5, "mm"))
+
+alt_nif_santos_0.9cov_rnk_list <- alt_nif_santos_0.9cov_rnk_chm_1 + alt_nif_santos_0.9cov_rnk_chm_2 + alt_nif_santos_0.9cov_rnk_chm_3
+
+#alt_nif_santos_0.9cov_rnk_chm <- 
+#draw(alt_nif_santos_0.9cov_rnk_list, heatmap_legend_side = "right", annotation_legend_side = "right")
+
+```
+
